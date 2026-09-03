@@ -1,0 +1,12 @@
+[Unit]
+Description=Запуск AI dev loop (%i) каждые 15 минут
+
+[Timer]
+OnBootSec=2min
+# Следующий запуск через 15 мин ПОСЛЕ окончания предыдущего —
+# итерации одного репозитория никогда не наслаиваются
+OnUnitInactiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

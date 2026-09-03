@@ -1,0 +1,15 @@
+[Unit]
+Description=AI dev loop (%i) — одна итерация разработки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=REPLACE_ME_USER
+# %i = имя инстанса: ai-dev@backend → /etc/ai-dev-backend.env,
+#                    ai-dev@android → /etc/ai-dev-android.env
+EnvironmentFile=/etc/ai-dev-%i.env
+ExecStart=/opt/ai-dev/orchestrator-ci.sh
+Nice=10
+# Итерация с ожиданием CI может идти долго — даём запас
+TimeoutStartSec=2h

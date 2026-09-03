@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════════
+#  CI для BACKEND-репозитория (Java / Spring).
+#  Положить как: .github/workflows/ci.yml
+#  Сборщик определяется автоматически: Gradle wrapper или Maven.
+# ═══════════════════════════════════════════════════════════════════
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    name: Сборка и тесты backend (Java/Spring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'   # Spring Boot 3.x; поставьте '21', если проект на нём
+
+      - name: Сборка и тесты (Gradle или Maven — что есть в репо)
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon build
+          elif [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            ./mvnw -B verify
+          elif [ -f pom.xml ]; then
+            mvn -B verify
+          else
+            echo "::error::Не найден ни gradlew, ни mvnw, ни pom.xml"
+            exit 1
+          fi
+
+      # Тесты на Testcontainers/Docker? На ubuntu-runner Docker уже
+      # есть — заработает из коробки, ничего добавлять не нужно.
+
+      # Smoke-тест VPN-части (если она в этом репо):
+      # - run: ./scripts/vpn-smoke-test.sh
