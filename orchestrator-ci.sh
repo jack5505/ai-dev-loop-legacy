@@ -58,6 +58,40 @@ tg() {
     --data-urlencode text="$1" >/dev/null || true
 }
 
+# ─── Зависшие авто-merge (конфликт возник ПОСЛЕ постановки в очередь) ──
+# gh pr merge --auto просто ставит PR в очередь на слияние, когда позеленеют
+# чеки. Если после этого в BASE_BRANCH прилетел другой коммит и вызвал
+# конфликт — PR тихо висит вечно: сам процесс уже завершился, TASK_LABEL
+# снят, и оркестратор больше никогда не вернётся к этой issue сам. Поэтому
+# каждый круг перепроверяем ВСЕ открытые PR наших веток на этот случай —
+# до того как браться за следующую задачу.
+sweep_stuck_merges() {
+  local prs pr url state amr body num already
+  prs=$(gh pr list --state open --json url,body,mergeStateStatus,autoMergeRequest,headRefName \
+          --jq '[.[] | select(.headRefName | startswith("ai/issue-"))]' 2>/dev/null || echo '[]')
+  [ "$(echo "$prs" | jq 'length')" -eq 0 ] && return 0
+  while IFS= read -r pr; do
+    url=$(echo "$pr" | jq -r .url)
+    state=$(echo "$pr" | jq -r .mergeStateStatus)
+    amr=$(echo "$pr" | jq -r '.autoMergeRequest // empty')
+    body=$(echo "$pr" | jq -r .body)
+    [ -z "$amr" ] && continue
+    { [ "$state" = "DIRTY" ] || [ "$state" = "CONFLICTING" ]; } || continue
+    num=$(echo "$body" | grep -oE '(AI-TASK: #|Closes #)[0-9]+' | grep -oE '[0-9]+' | head -n1 || true)
+    [ -z "$num" ] && continue
+    already=no
+    gh issue view "$num" --json labels --jq '.labels[].name' 2>/dev/null \
+      | grep -qx "$HUMAN_LABEL" && already=yes
+    [ "$already" = yes ] && continue
+    gh pr merge "$url" --disable-auto 2>/dev/null || true
+    gh issue edit "$num" --add-label "$HUMAN_LABEL" 2>/dev/null || true
+    gh pr comment "$url" --body "⚠️ Авто-merge был поставлен в очередь, но PR теперь конфликтует с \`$BASE_BRANCH\` (кто-то смёржил другой PR раньше). Авто-merge снят — нужен ручной rebase." 2>/dev/null || true
+    gh issue comment "$num" --body "⚠️ PR $url ждал авто-merge, но возник конфликт с \`$BASE_BRANCH\` — нужен человек." 2>/dev/null || true
+    tg "⚠️ AI dev loop: PR $url (issue #$num) — конфликт после постановки в авто-merge, нужен ручной rebase."
+    log "Обнаружил зависший конфликт: $url — передал человеку."
+  done < <(echo "$prs" | jq -c '.[]')
+}
+
 # ─── Межрепозиторная блокировка ─────────────────────────────────────
 # Метка blocked = задача ждёт починки в другом репозитории.
 # Маркер в комментарии: BLOCKED-BY: owner/repo#123
@@ -167,7 +201,11 @@ git fetch origin
 git checkout "$BASE_BRANCH"
 git reset --hard "origin/$BASE_BRANCH"
 
-# Сначала возвращаем в очередь задачи, чей блокер в соседнем репо закрыт:
+# Сначала ищем PR, чей авто-merge завис из-за конфликта, возникшего уже
+# после постановки в очередь (см. sweep_stuck_merges выше):
+sweep_stuck_merges
+
+# Возвращаем в очередь задачи, чей блокер в соседнем репо закрыт:
 unblock_ready_issues
 
 # Защита от prompt injection: в очередь попадают ТОЛЬКО issues от
@@ -458,15 +496,42 @@ gh pr comment "$PR_URL" --body "## 🤖 Авто-ревью
 $REVIEW"
 
 # ═══ 5. Merge ═══════════════════════════════════════════════════════
-if [ "$AUTO_MERGE" = "true" ] && echo "$REVIEW" | grep -q "VERDICT: APPROVE"; then
-  gh pr merge "$PR_URL" --squash --auto
-  gh issue comment "$NUM" --body "✅ Ревью пройдено, PR поставлен на авто-merge: $PR_URL"
-  tg "✅ AI dev loop: #$NUM «$TITLE» готово и уходит в авто-merge: $PR_URL"
-  log "Авто-merge включён для $PR_URL"
+# mergeStateStatus проверяем ДО авто-merge: --auto у gh просто ставит PR
+# в очередь на слияние, когда чеки позеленеют, но молчит, если уже сейчас
+# есть конфликт с BASE_BRANCH — такой PR завис бы незамеченным (задача уже
+# сдана с рук, TASK_LABEL снят). Более поздний конфликт (появившийся уже
+# после этого прогона) ловит sweep_stuck_merges в начале следующего круга.
+MERGE_STATE=$(gh pr view "$PR_URL" --json mergeStateStatus --jq .mergeStateStatus 2>/dev/null || echo UNKNOWN)
+CONFLICT=false
+if [ "$MERGE_STATE" = "DIRTY" ] || [ "$MERGE_STATE" = "CONFLICTING" ]; then
+  CONFLICT=true
+fi
+
+if echo "$REVIEW" | grep -q "VERDICT: APPROVE"; then
+  if [ "$CONFLICT" = true ]; then
+    gh issue edit "$NUM" --add-label "$HUMAN_LABEL"
+    gh issue comment "$NUM" --body "⚠️ Ревью одобрено, но PR конфликтует с \`$BASE_BRANCH\` — авто-merge не запускаю. Нужен ручной rebase: $PR_URL"
+    tg "⚠️ AI dev loop: #$NUM «$TITLE» одобрен ревью, но конфликт с $BASE_BRANCH — нужен ручной rebase: $PR_URL"
+    log "PR одобрен, но конфликтует — передал человеку."
+  elif [ "$AUTO_MERGE" = "true" ]; then
+    gh pr merge "$PR_URL" --squash --auto
+    gh issue comment "$NUM" --body "✅ Ревью пройдено, PR поставлен на авто-merge: $PR_URL"
+    tg "✅ AI dev loop: #$NUM «$TITLE» готово и уходит в авто-merge: $PR_URL"
+    log "Авто-merge включён для $PR_URL"
+  else
+    gh issue comment "$NUM" --body "👀 PR готов и ждёт вашего решения: $PR_URL"
+    tg "👀 AI dev loop: #$NUM «$TITLE» — PR готов, глянь, когда будет минутка: $PR_URL"
+    log "PR ждёт человека: $PR_URL"
+  fi
 else
-  gh issue comment "$NUM" --body "👀 PR готов и ждёт вашего решения: $PR_URL"
-  tg "👀 AI dev loop: #$NUM «$TITLE» — PR готов, глянь, когда будет минутка: $PR_URL"
-  log "PR ждёт человека: $PR_URL"
+  # VERDICT: REQUEST_CHANGES — раньше это тонуло в том же нейтральном
+  # «глянь, когда будет минутка», что и обычный approve без авто-merge, и
+  # без HUMAN_LABEL. Из-за этого PR мог зависнуть незамеченным. Теперь —
+  # отдельная, тревожная ветка с явной меткой.
+  gh issue edit "$NUM" --add-label "$HUMAN_LABEL"
+  gh issue comment "$NUM" --body "⚠️ Авто-ревью запросило правки (VERDICT: REQUEST_CHANGES) — нужен человек: $PR_URL"
+  tg "⚠️ AI dev loop: #$NUM «$TITLE» — ревью запросило правки, нужен ты: $PR_URL"
+  log "Ревью запросило правки — передал человеку."
 fi
 
 gh issue edit "$NUM" --remove-label "$TASK_LABEL"
