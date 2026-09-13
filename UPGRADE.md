@@ -68,7 +68,7 @@ gh secret list -R jack5505/mahalla-android   # проверь, что появи
 ```bash
 sudo tee -a /etc/ai-dev-android.env > /dev/null << 'EOF'
 DEV_MODE=github-app
-APP_WAIT_MIN=45
+APP_WAIT_MIN=180
 EOF
 sudo grep -E '^(DEV_MODE|APP_WAIT_MIN)' /etc/ai-dev-android.env
 ```

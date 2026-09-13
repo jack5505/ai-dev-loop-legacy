@@ -32,7 +32,7 @@ ALLOWED_AUTHORS="${ALLOWED_AUTHORS:-}"  # GitHub-логины (через про
                                         # gh-токена (защита от prompt injection)
 DEV_MODE="${DEV_MODE:-local}"           # local = Claude думает на этом сервере;
                                         # github-app = @claude на GitHub Actions
-APP_WAIT_MIN="${APP_WAIT_MIN:-45}"      # github-app: сколько минут ждать PR/фикс
+APP_WAIT_MIN="${APP_WAIT_MIN:-180}"     # github-app: сколько минут ждать PR/фикс
 # Замок уникален для каждого репозитория — циклы двух репо не мешают друг другу:
 LOCK_FILE="${LOCK_FILE:-/tmp/ai-dev-$(basename "$REPO_DIR").lock}"
 # Telegram-уведомления (необязательно; пусто = выключено, см. TELEGRAM.md):

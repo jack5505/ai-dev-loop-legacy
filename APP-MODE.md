@@ -19,7 +19,7 @@
    `NEEDS-PARTNER: <описание>` — сервер сам заводит задачу в backend,
    ставит blocked и после починки возвращает задачу на перепроверку.
    Пинг-понг-защита работает как раньше (`CANNOT-FIX-HERE` → человеку).
-7. Если PR или фикс не появились за APP_WAIT_MIN (45 мин) —
+7. Если PR или фикс не появились за APP_WAIT_MIN (180 мин) —
    `needs-human` и пинг в Telegram.
 
 ## Включение — 4 шага
@@ -52,7 +52,7 @@ if: |
 sudoedit /etc/ai-dev-android.env
 # добавить:
 DEV_MODE=github-app
-APP_WAIT_MIN=45
+APP_WAIT_MIN=180
 ```
 
 В `/etc/ai-dev-backend.env` ничего не менять (там остаётся local).
