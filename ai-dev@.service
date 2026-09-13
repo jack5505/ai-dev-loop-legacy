@@ -12,4 +12,5 @@ EnvironmentFile=/etc/ai-dev-%i.env
 ExecStart=/opt/ai-dev/orchestrator-ci.sh
 Nice=10
 # Итерация с ожиданием CI может идти долго — даём запас
-TimeoutStartSec=2h
+# APP_WAIT_MIN=180 (3ч ожидания PR/фикса) + время CI → ставим потолок 4ч
+TimeoutStartSec=4h
