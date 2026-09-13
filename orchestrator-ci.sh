@@ -93,9 +93,16 @@ issue_has_marker() {  # $1 = номер issue, $2 = маркер (в начал�
   # «NEEDS-PARTNER:»/«CANNOT-FIX-HERE:» упомянут по-русски, давал ложное
   # срабатывание — задача блокировалась через ~60 c после старта, ещё до
   # того как агент успевал ответить.
-  gh issue view "$1" --json comments \
-    --jq --arg me "${SELF_LOGIN:-}" '.comments[] | select(.author.login != $me) | .body' \
-    | grep -qE "^[[:space:]]*$2"
+  # Логин подставляем через окружение: у `gh --jq` нет --arg (это не внешний
+  # jq, а встроенный), и лишние слова уезжали в позиционные аргументы —
+  # `gh issue view` падал с «accepts 1 arg(s), received 4», маркер не находился
+  # НИКОГДА, и задача крутилась по кругу до таймаута APP_WAIT_MIN.
+  # Вывод складываем в переменную, а не пайпим: `grep -q` закрывает пайп на
+  # первом совпадении, gh получает SIGPIPE (141) и pipefail гасит успех.
+  local bodies
+  bodies=$(SELF_LOGIN="${SELF_LOGIN:-}" gh issue view "$1" --json comments \
+    --jq '.comments[] | select(.author.login != env.SELF_LOGIN) | .body') || return 1
+  printf '%s\n' "$bodies" | grep -qE "^[[:space:]]*$2"
 }
 
 find_task_pr() {  # $1 = номер issue → URL открытого PR с маркером AI-TASK
