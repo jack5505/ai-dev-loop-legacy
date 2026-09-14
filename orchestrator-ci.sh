@@ -113,6 +113,22 @@ find_task_pr() {  # $1 = номер issue → URL открытого PR с ма�
 
 pr_head_sha() { gh pr view "$1" --json headRefOid --jq .headRefOid; }
 
+# github-app: @claude закончил работу и написал итоговый комментарий
+# (в теле — «Claude finished»). Смотрим только комментарии, появившиеся
+# ПОСЛЕ поручения, иначе сработает вердикт с прошлого круга.
+# Без этой проверки задача, по которой агент решил не открывать PR,
+# висела в ожидании все APP_WAIT_MIN и возвращалась в очередь снова
+# и снова (#237: ответ за 36 сек — ожидание 180 мин).
+claude_finished_since() {  # $1 = issue|pr, $2 = номер/URL, $3 = unix-время
+  local n
+  n=$(gh "$1" view "$2" --json comments --jq \
+        "[.comments[]
+          | select(.author.login == \"claude\")
+          | select((.createdAt | fromdateiso8601) >= $3)
+          | select(.body | test(\"Claude finished\"))] | length" 2>/dev/null) || return 1
+  [ "${n:-0}" -gt 0 ]
+}
+
 # Реакция на сигналы агента про партнёрский репозиторий (github-app).
 # NEEDS-PARTNER → сервер сам заводит задачу у партнёра и блокирует эту.
 # CANNOT-FIX-HERE (или NEEDS-PARTNER при включённой защите) → человеку.
@@ -324,6 +340,7 @@ fi
 
 else
   # ═══ 2-app. Поручаем задачу @claude на GitHub Actions ═════════════
+  ASSIGNED_AT=$(date +%s)
   gh issue comment "$NUM" --body "@claude Реализуй задачу из этого issue.
 Требования:
 - следуй CLAUDE.md репозитория;
@@ -333,18 +350,29 @@ else
 
   log "Задача поручена @claude, жду появления PR (до $APP_WAIT_MIN мин)…"
   PR_URL=""
-  DEADLINE=$(( $(date +%s) + APP_WAIT_MIN * 60 ))
+  VERDICT_NO_PR=false
+  DEADLINE=$(( ASSIGNED_AT + APP_WAIT_MIN * 60 ))
   while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     sleep 60
     handle_partner_signal "$NUM" ""
     PR_URL=$(find_task_pr "$NUM")
     [ -n "$PR_URL" ] && break
+    if claude_finished_since issue "$NUM" "$ASSIGNED_AT"; then
+      VERDICT_NO_PR=true
+      break
+    fi
   done
 
   if [ -z "$PR_URL" ]; then
     gh issue edit "$NUM" --add-label "$HUMAN_LABEL"
-    gh issue comment "$NUM" --body "🛑 @claude не открыл PR за $APP_WAIT_MIN минут — нужен человек (ход работы: комментарии и вкладка Actions)."
-    tg "🛑 AI dev loop: #$NUM «$TITLE» — PR от @claude не появился за $APP_WAIT_MIN мин. Нужен ты."
+    if [ "$VERDICT_NO_PR" = true ]; then
+      log "@claude завершил работу без PR — задача уходит человеку."
+      gh issue comment "$NUM" --body "🛑 @claude завершил работу и PR не открыл — нужен человек. Если задача уже сделана, закрой issue; если нет — переформулируй и сними метку \`$HUMAN_LABEL\` (ход работы: комментарии и вкладка Actions)."
+      tg "🛑 AI dev loop: #$NUM «$TITLE» — @claude отработал, но PR не открыл. Нужен ты."
+    else
+      gh issue comment "$NUM" --body "🛑 @claude не открыл PR за $APP_WAIT_MIN минут — нужен человек (ход работы: комментарии и вкладка Actions)."
+      tg "🛑 AI dev loop: #$NUM «$TITLE» — PR от @claude не появился за $APP_WAIT_MIN мин. Нужен ты."
+    fi
     exit 0
   fi
   log "PR от @claude: $PR_URL"
@@ -424,15 +452,23 @@ $FAIL_TAIL
 
 Найди причину, исправь и запушь коммит в эту же ветку.$BLOCK_HINT"
     log "Жду фикс от @claude (до $APP_WAIT_MIN мин)…"
-    DEADLINE=$(( $(date +%s) + APP_WAIT_MIN * 60 ))
+    ASKED_AT=$(date +%s)
+    DEADLINE=$(( ASKED_AT + APP_WAIT_MIN * 60 ))
     FIXED=false
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
       sleep 60
       handle_partner_signal "$NUM" "$PR_URL"
       if [ "$(pr_head_sha "$PR_URL")" != "$OLD_SHA" ]; then FIXED=true; break; fi
+      # Агент отчитался, но коммита нет — сам он уже не запушит.
+      if claude_finished_since pr "$PR_URL" "$ASKED_AT"; then
+        log "@claude завершил работу, но коммит не запушил — передаю человеку."
+        break
+      fi
     done
     if [ "$FIXED" != true ]; then
-      log "Фикс от @claude не пришёл за $APP_WAIT_MIN мин — передаю человеку."
+      if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        log "Фикс от @claude не пришёл за $APP_WAIT_MIN мин — передаю человеку."
+      fi
       break
     fi
   fi
