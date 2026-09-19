@@ -1,0 +1,16 @@
+[Unit]
+Description=AI dev loop (%i) — смотритель бэклога
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aidev
+# %i = имя инстанса: ai-backlog@backend → /etc/ai-dev-backend.env,
+#                    ai-backlog@android → /etc/ai-dev-android.env
+# Тот же env, что и у оркестратора: REPO_DIR, метки, Telegram, ключи.
+EnvironmentFile=/etc/ai-dev-%i.env
+ExecStart=/opt/ai-dev/backlog-keeper.sh
+Nice=15
+# Два поручения Claude подряд, каждое с чтением репозитория и истории issue.
+TimeoutStartSec=2h

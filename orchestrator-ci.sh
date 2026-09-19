@@ -21,6 +21,10 @@ BASE_BRANCH="${BASE_BRANCH:-main}"
 TASK_LABEL="${TASK_LABEL:-ai-task}"
 HUMAN_LABEL="${HUMAN_LABEL:-needs-human}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-3}"
+MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-2}"  # сколько раз отдавать агенту
+                                        # замечания ревью, прежде чем звать человека
+PR_STALE_DAYS="${PR_STALE_DAYS:-3}"     # открытый AI-PR без движения дольше
+                                        # этого срока попадает в сводку сторожа
 MAX_BUDGET_USD="${MAX_BUDGET_USD:-5}"   # действует только с API-ключом
 CLAUDE_MODEL="${CLAUDE_MODEL:-sonnet}"
 AUTO_MERGE="${AUTO_MERGE:-false}"
@@ -65,13 +69,29 @@ tg() {
 # сама возвращается в очередь на перепроверку.
 unblock_ready_issues() {
   [ -z "$PARTNER_REPO" ] && return 0
-  local ids num marker ref state
-  ids=$(gh issue list --state open --label blocked --json number --jq '.[].number')
-  for num in $ids; do
+  local rows num title marker ref state
+  rows=$(gh issue list --state open --label blocked --json number,title \
+    --jq '.[] | "\(.number)\t\(.title)"')
+  while IFS=$'\t' read -r num title; do
+    [ -z "$num" ] && continue
     marker=$(gh issue view "$num" --json body,comments \
       --jq '[.body] + [.comments[].body] | join("\n")' \
       | grep -oE 'BLOCKED-BY: [^#[:space:]]+#[0-9]+' | tail -n1 || true)
-    [ -z "$marker" ] && continue
+    if [ -z "$marker" ]; then
+      # Метка blocked без маркера BLOCKED-BY — задача ждёт того, чего система
+      # не знает. Раньше тут был молчаливый `continue`, и такая задача пропадала
+      # навсегда: из очереди исключена (-label:blocked), в needs-human не
+      # попадает, ни в один алерт не приходит. К 2026-09-19 так накопилось
+      # 10 штук начиная с 03.09 — часть ждала блокеров, закрытых ещё неделю
+      # назад. Теперь такие задачи сразу уходят человеку.
+      gh issue edit "$num" --remove-label blocked --add-label "$HUMAN_LABEL"
+      gh issue comment "$num" --body "🛑 Метка \`blocked\` стоит без маркера \`BLOCKED-BY: owner/repo#N\`, поэтому система не знает, чего эта задача ждёт, и разблокировать её сама не может.
+
+Что сделать: либо добавь комментарий вида \`BLOCKED-BY: $PARTNER_REPO#<номер>\` и верни метку \`blocked\` — тогда задача разблокируется автоматически, когда блокер закроют; либо просто сними \`$HUMAN_LABEL\`, чтобы задача вернулась в очередь."
+      tg "🛑 AI dev loop: #$num «$title» помечена blocked без маркера BLOCKED-BY — не знаю, чего она ждёт. Нужен ты."
+      log "Issue #$num: blocked без BLOCKED-BY — передал человеку."
+      continue
+    fi
     ref="${marker#BLOCKED-BY: }"
     state=$(gh issue view "${ref##*#}" -R "${ref%#*}" --json state --jq .state 2>/dev/null || echo UNKNOWN)
     if [ "$state" = "CLOSED" ]; then
@@ -79,15 +99,46 @@ unblock_ready_issues() {
       gh issue comment "$num" --body "🔓 Блокировка снята: $ref закрыт. Задача вернулась в очередь на перепроверку."
       log "Разблокировал issue #$num (ждал $ref)"
     fi
-  done
+  done <<< "$rows"
 }
 
 issue_is_blocked() {  # $1 = номер issue
   gh issue view "$1" --json labels --jq '.labels[].name' | grep -qx blocked
 }
 
+# ─── Сторож открытых PR ─────────────────────────────────────────────
+# Итерация заканчивается на `remove-label ai-task`: задача уходит из очереди,
+# а открытый PR после этого не сторожит никто. К 2026-09-19 так накопилось
+# 13 открытых PR (старшему 10 дней), пять из них CONFLICTING, и цикл об этом
+# не знал — слова `mergeable` в скрипте не было вовсе.
+# Проход только ДОКЛАДЫВАЕТ: сам ничего не чинит и минуты Actions не жжёт.
+watch_open_prs() {
+  local rows num upd state stale_before report="" stamp
+  stale_before=$(date -u -d "$PR_STALE_DAYS days ago" +%s 2>/dev/null) || return 0
+  # Одним запросом на все PR: поштучный опрос mergeable занимал бы минуты
+  # на каждом круге таймера.
+  rows=$(gh pr list --state open --limit 100 --json number,updatedAt,mergeable,body \
+    --jq '.[] | select(.body | test("AI-TASK: #[0-9]+|Closes #[0-9]+")) | "\(.number)\t\(.updatedAt)\t\(.mergeable)"' \
+    2>/dev/null) || return 0
+  while IFS=$'\t' read -r num upd state; do
+    [ -z "$num" ] && continue
+    if [ "$state" = "CONFLICTING" ]; then
+      report+="  #$num — конфликт с $BASE_BRANCH, нужен ребейз"$'\n'
+    elif [ "$(date -u -d "$upd" +%s 2>/dev/null || echo 9999999999)" -lt "$stale_before" ]; then
+      report+="  #$num — без движения с ${upd%%T*}"$'\n'
+    fi
+  done <<< "$rows"
+  [ -z "$report" ] && return 0
+  log "Открытые AI-PR, требующие внимания:"$'\n'"$report"
+  # Telegram — не чаще раза в сутки, иначе сводка придёт каждые 15 минут.
+  stamp="$LOG_DIR/.pr-watch-$(date +%F)"
+  [ -e "$stamp" ] && return 0
+  : > "$stamp"
+  tg "👁 AI dev loop ($(basename "$REPO_DIR")): открытые PR требуют внимания:"$'\n'"$report"
+}
+
 # ─── Режим github-app: помощники ────────────────────────────────────
-issue_has_marker() {  # $1 = номер issue, $2 = маркер (в начале строки комментария агента)
+issue_has_marker() {  # $1 = номер issue, $2 = маркер, $3 = unix-время поручения
   # Маркер ищем ТОЛЬКО в комментариях агента (не самого оркестратора) и
   # ТОЛЬКО в начале строки. Иначе инструктаж оркестратора, где сам текст
   # «NEEDS-PARTNER:»/«CANNOT-FIX-HERE:» упомянут по-русски, давал ложное
@@ -99,19 +150,78 @@ issue_has_marker() {  # $1 = номер issue, $2 = маркер (в начал�
   # НИКОГДА, и задача крутилась по кругу до таймаута APP_WAIT_MIN.
   # Вывод складываем в переменную, а не пайпим: `grep -q` закрывает пайп на
   # первом совпадении, gh получает SIGPIPE (141) и pipefail гасит успех.
-  local bodies
+  # $3 — как в claude_finished_since: смотрим только комментарии ПОСЛЕ
+  # поручения. Без этого вердикт с прошлого круга срабатывал снова: задача,
+  # вернувшаяся из-под blocked, на первой же итерации ожидания натыкалась на
+  # свой же старый NEEDS-PARTNER и заводила дубль у партнёра (android#226 →
+  # mahalla#217, а через 6 суток он же → mahalla#272), пока текущий прогон
+  # агента ещё шёл.
+  local bodies since="${3:-0}"
   bodies=$(SELF_LOGIN="${SELF_LOGIN:-}" gh issue view "$1" --json comments \
-    --jq '.comments[] | select(.author.login != env.SELF_LOGIN) | .body') || return 1
+    --jq ".comments[]
+          | select(.author.login != env.SELF_LOGIN)
+          | select((.createdAt | fromdateiso8601) >= $since)
+          | .body") || return 1
   printf '%s\n' "$bodies" | grep -qE "^[[:space:]]*$2"
 }
 
-find_task_pr() {  # $1 = номер issue → URL открытого PR с маркером AI-TASK
-  gh pr list --state open \
+find_task_pr() {  # $1 = номер issue → URL открытого PR по этой задаче
+  local url
+  url=$(gh pr list --state open \
     --search "\"AI-TASK: #$1\" in:body" \
+    --json url --jq '.[0].url // empty')
+  [ -n "$url" ] && { echo "$url"; return 0; }
+  # Агент обязан ставить обе строки, но ставит не всегда: PR #315 в
+  # mahalla-android получил только «Closes #314», из-за чего стал невидим
+  # для цикла — тот считал, что PR не существует, и PR завис навсегда.
+  gh pr list --state open \
+    --search "\"Closes #$1\" in:body" \
     --json url --jq '.[0].url // empty'
 }
 
 pr_head_sha() { gh pr view "$1" --json headRefOid --jq .headRefOid; }
+
+# GitHub считает mergeable лениво: первый запрос по «остывшему» PR отдаёт
+# UNKNOWN и только запускает расчёт. Поэтому переспрашиваем.
+pr_mergeable() {  # $1 = PR → MERGEABLE | CONFLICTING | UNKNOWN
+  local i state
+  for i in 1 2 3; do
+    state=$(gh pr view "$1" --json mergeable --jq .mergeable 2>/dev/null || echo UNKNOWN)
+    [ "$state" != "UNKNOWN" ] && { echo "$state"; return 0; }
+    sleep 3
+  done
+  echo UNKNOWN
+}
+
+# Просим агента доработать PR и ждём новый коммит в той же ветке.
+# Возвращает 0, если коммит появился. Логика ожидания — та же, что у
+# дожима красного CI (github-app), плюс ветка для local-режима.
+agent_rework() {  # $1 = PR, $2 = номер issue, $3 = текст поручения
+  local old_sha asked_at deadline
+  old_sha=$(pr_head_sha "$1")
+  if [ "$DEV_MODE" = "local" ]; then
+    run_claude "$3$BLOCK_HINT" 2>&1 | tee "$LOG_DIR/issue-$2-rework.log" \
+      || log "⚠️ claude завершился с ошибкой, идём дальше"
+    if [ -n "$PARTNER_REPO" ] && issue_is_blocked "$2"; then return 1; fi
+    git push --force-with-lease || return 1
+    [ "$(pr_head_sha "$1")" != "$old_sha" ]
+    return $?
+  fi
+  gh pr comment "$1" --body "@claude $3$BLOCK_HINT"
+  asked_at=$(date +%s)
+  deadline=$(( asked_at + APP_WAIT_MIN * 60 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 60
+    handle_partner_signal "$2" "$1" "$asked_at"
+    [ "$(pr_head_sha "$1")" != "$old_sha" ] && return 0
+    if claude_finished_since pr "$1" "$asked_at"; then
+      log "@claude отчитался, но коммита нет."
+      return 1
+    fi
+  done
+  log "Ответ от @claude не пришёл за $APP_WAIT_MIN мин."
+  return 1
+}
 
 # github-app: @claude закончил работу и написал итоговый комментарий
 # (в теле — «Claude finished»). Смотрим только комментарии, появившиеся
@@ -133,20 +243,40 @@ claude_finished_since() {  # $1 = issue|pr, $2 = номер/URL, $3 = unix-вр�
 # NEEDS-PARTNER → сервер сам заводит задачу у партнёра и блокирует эту.
 # CANNOT-FIX-HERE (или NEEDS-PARTNER при включённой защите) → человеку.
 # При срабатывании функция завершает весь скрипт.
-handle_partner_signal() {  # $1 = номер issue, $2 = URL PR (может быть пустым)
+handle_partner_signal() {  # $1 = номер issue, $2 = URL PR (может быть пустым), $3 = unix-время поручения
   [ -z "$PARTNER_REPO" ] && return 0
-  if issue_has_marker "$1" "CANNOT-FIX-HERE:" \
-     || { [ "$PINGPONG_GUARD" = true ] && issue_has_marker "$1" "NEEDS-PARTNER:"; }; then
+  local since="${3:-0}"
+  if issue_has_marker "$1" "CANNOT-FIX-HERE:" "$since" \
+     || { [ "$PINGPONG_GUARD" = true ] && issue_has_marker "$1" "NEEDS-PARTNER:" "$since"; }; then
     gh issue edit "$1" --add-label "$HUMAN_LABEL"
     [ -n "$2" ] && gh pr close "$2" --comment "🛑 Агент считает, что чинить нужно не здесь, а встречная блокировка запрещена (защита от пинг-понга) — задача передана человеку." || true
     tg "🛑 AI dev loop: #$1 «$TITLE» — агенты двух репо не договорились, где чинить. Нужен ты."
     log "Пинг-понг остановлен, задача у человека."
     exit 0
   fi
-  if issue_has_marker "$1" "NEEDS-PARTNER:"; then
-    local details new
+  if issue_has_marker "$1" "NEEDS-PARTNER:" "$since"; then
+    local details new twin
+    # Подстраховка от дубля: если задача с этим же ORIGIN у партнёра уже
+    # заводилась — не создаём вторую, а переиспользуем её. Открытую ждём,
+    # закрытую считаем уже починенной и идём работать дальше.
+    twin=$(gh issue list -R "$PARTNER_REPO" --state all --limit 1 \
+      --search "\"ORIGIN: $THIS_REPO#$1\" in:body sort:created-desc" \
+      --json number,state --jq '.[0] | "\(.number) \(.state)"' 2>/dev/null || true)
+    if [ -n "$twin" ]; then
+      if [ "${twin#* }" = "CLOSED" ]; then
+        log "У партнёра уже есть закрытая задача #${twin%% *} с этим ORIGIN — блокировку не ставлю."
+        return 0
+      fi
+      gh issue comment "$1" --body "BLOCKED-BY: $PARTNER_REPO#${twin%% *}"
+      gh issue edit "$1" --add-label blocked
+      [ -n "$2" ] && gh pr close "$2" --comment "⏳ Причина на стороне $PARTNER_REPO — задача там уже заведена ранее. После починки эта задача автоматически вернётся в очередь." || true
+      tg "⏳ AI dev loop: #$1 «$TITLE» заблокирована — ждёт $PARTNER_REPO#${twin%% *} (задача там уже была)."
+      log "Задача #$1 ждёт существующую $PARTNER_REPO#${twin%% *}. Стоп."
+      exit 0
+    fi
     details=$(gh issue view "$1" --json comments \
-      --jq '[.comments[].body] | join("\n")' | grep -m1 -A20 'NEEDS-PARTNER:')
+      --jq "[.comments[] | select((.createdAt | fromdateiso8601) >= $since) | .body] | join(\"\n\")" \
+      | grep -m1 -A20 'NEEDS-PARTNER:')
     new=$(gh issue create -R "$PARTNER_REPO" --label ai-task \
       --title "Из $THIS_REPO#$1: $TITLE" \
       --body "ORIGIN: $THIS_REPO#$1
@@ -192,6 +322,9 @@ git reset --hard "origin/$BASE_BRANCH"
 
 # Сначала возвращаем в очередь задачи, чей блокер в соседнем репо закрыт:
 unblock_ready_issues
+
+# Затем докладываем про открытые PR, которые зависли без внимания:
+watch_open_prs
 
 # Защита от prompt injection: в очередь попадают ТОЛЬКО issues от
 # доверенных авторов. По умолчанию — владелец gh-токена; межрепозиторные
@@ -341,27 +474,37 @@ fi
 else
   # ═══ 2-app. Поручаем задачу @claude на GitHub Actions ═════════════
   ASSIGNED_AT=$(date +%s)
-  gh issue comment "$NUM" --body "@claude Реализуй задачу из этого issue.
+  VERDICT_NO_PR=false
+
+  # Задача могла вернуться в очередь (сняли blocked, перезапустили юнит) уже
+  # с готовым PR от прошлого прогона. Звать @claude второй раз — холостой
+  # прогон Actions и лишние комментарии в issue ради того же результата,
+  # поэтому сначала ищем существующий PR и только потом поручаем.
+  PR_URL=$(find_task_pr "$NUM")
+
+  if [ -n "$PR_URL" ]; then
+    log "По задаче #$NUM уже открыт PR: $PR_URL — @claude не зову."
+  else
+    gh issue comment "$NUM" --body "@claude Реализуй задачу из этого issue.
 Требования:
 - следуй CLAUDE.md репозитория;
 - где возможно, прогони сборку и тесты у себя перед пушем;
 - открой pull request в ветку $BASE_BRANCH;
 - в описании PR обязательно укажи две строки: «AI-TASK: #$NUM» и «Closes #$NUM».$BLOCK_HINT"
 
-  log "Задача поручена @claude, жду появления PR (до $APP_WAIT_MIN мин)…"
-  PR_URL=""
-  VERDICT_NO_PR=false
-  DEADLINE=$(( ASSIGNED_AT + APP_WAIT_MIN * 60 ))
-  while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    sleep 60
-    handle_partner_signal "$NUM" ""
-    PR_URL=$(find_task_pr "$NUM")
-    [ -n "$PR_URL" ] && break
-    if claude_finished_since issue "$NUM" "$ASSIGNED_AT"; then
-      VERDICT_NO_PR=true
-      break
-    fi
-  done
+    log "Задача поручена @claude, жду появления PR (до $APP_WAIT_MIN мин)…"
+    DEADLINE=$(( ASSIGNED_AT + APP_WAIT_MIN * 60 ))
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+      sleep 60
+      handle_partner_signal "$NUM" "" "$ASSIGNED_AT"
+      PR_URL=$(find_task_pr "$NUM")
+      [ -n "$PR_URL" ] && break
+      if claude_finished_since issue "$NUM" "$ASSIGNED_AT"; then
+        VERDICT_NO_PR=true
+        break
+      fi
+    done
+  fi
 
   if [ -z "$PR_URL" ]; then
     gh issue edit "$NUM" --add-label "$HUMAN_LABEL"
@@ -457,7 +600,7 @@ $FAIL_TAIL
     FIXED=false
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
       sleep 60
-      handle_partner_signal "$NUM" "$PR_URL"
+      handle_partner_signal "$NUM" "$PR_URL" "$ASKED_AT"
       if [ "$(pr_head_sha "$PR_URL")" != "$OLD_SHA" ]; then FIXED=true; break; fi
       # Агент отчитался, но коммита нет — сам он уже не запушит.
       if claude_finished_since pr "$PR_URL" "$ASKED_AT"; then
@@ -484,24 +627,104 @@ PR (draft): $PR_URL. Логи CI: вкладка Checks в PR."
   exit 0
 fi
 
-# ═══ 4b. Справился → PR ready + авто-ревью ═════════════════════════
+# ═══ 4b. PR ready → мержабельность → цикл ревью ════════════════════
 gh pr ready "$PR_URL" 2>/dev/null || true   # PR от App может быть уже не draft
 
-REVIEW=$(gh pr diff "$PR_URL" | \
-  env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID claude "${CLAUDE_ARGS[@]}" \
-  "Ты строгий код-ревьюер. На stdin — дифф pull request'а.
+# Раньше цикл на mergeable не смотрел вовсе: PR, разошедшийся с $BASE_BRANCH,
+# уходил «ждать человека» как здоровый и оставался там навсегда.
+MERGE_STATE=$(pr_mergeable "$PR_URL")
+if [ "$MERGE_STATE" = "CONFLICTING" ]; then
+  log "PR конфликтует с $BASE_BRANCH — прошу агента подтянуть ветку."
+  if agent_rework "$PR_URL" "$NUM" "PR конфликтует с веткой \`$BASE_BRANCH\`. Влей свежий \`$BASE_BRANCH\` в ветку PR, разреши конфликты, ничего из изменений PR не потеряв, и запушь в ту же ветку. Логику задачи при этом не меняй."; then
+    MERGE_STATE=$(pr_mergeable "$PR_URL")
+  fi
+  if [ "$MERGE_STATE" = "CONFLICTING" ]; then
+    gh issue edit "$NUM" --add-label "$HUMAN_LABEL"
+    gh issue comment "$NUM" --body "🛑 PR конфликтует с \`$BASE_BRANCH\`, автоматически разрешить не вышло — нужен человек: $PR_URL"
+    tg "🛑 AI dev loop: #$NUM «$TITLE» — PR конфликтует с $BASE_BRANCH. Нужен ты: $PR_URL"
+    log "Конфликт не разрешён. Стоп."
+    exit 0
+  fi
+fi
+
+# Дожим ревью. Раньше вердикт не читался нигде, кроме ветки авто-merge:
+# и APPROVE, и REQUEST_CHANGES вели в один и тот же конец итерации, так что
+# замечания ревьюера не получал никто и PR копились.
+REVIEW_ROUND=1
+REVIEW_OK=false
+REWORK_WHY="авто-ревью осталось при \`REQUEST_CHANGES\` после $MAX_REVIEW_ROUNDS круга доработки"
+while :; do
+  REVIEW=$(gh pr diff "$PR_URL" | \
+    env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID claude "${CLAUDE_ARGS[@]}" \
+    "Ты строгий, но честный код-ревьюер. На stdin — дифф pull request'а.
 Проверь: безопасность (секреты, инъекции, права), корректность логики,
 обработку ошибок, качество кода. Пиши кратко и по делу, по-русски.
+
+ПРЕЖДЕ ЧЕМ НАЗВАТЬ ЧТО-ТО БЛОКЕРОМ — проверь себя:
+- CI на этом PR уже зелёный: сборка и тесты прошли. Поэтому замечание вида
+  «это не скомпилируется» почти наверняка твоя ошибка — перепроверь по коду
+  или не пиши его вовсе;
+- дифф показан относительно базы ветки, а НЕ результата мержа. Прежде чем
+  писать про порядок строк, дубли или «ветка отстала», проверь фактом:
+  \`git merge-tree --write-tree origin/$BASE_BRANCH <ветка PR>\`;
+- замечание без конкретного файла и строки — не замечание.
+Ложный блокер дороже пропущенного: по нему будет переписан рабочий код.
+
 САМОЙ ПОСЛЕДНЕЙ строкой выведи ровно одно из двух:
 VERDICT: APPROVE
 VERDICT: REQUEST_CHANGES")
 
-gh pr comment "$PR_URL" --body "## 🤖 Авто-ревью
+  gh pr comment "$PR_URL" --body "## 🤖 Авто-ревью (круг $REVIEW_ROUND из $MAX_REVIEW_ROUNDS)
 
 $REVIEW"
 
+  if echo "$REVIEW" | grep -q "VERDICT: APPROVE"; then
+    REVIEW_OK=true
+    log "Ревью пройдено на круге $REVIEW_ROUND ✅"
+    break
+  fi
+  if [ "$REVIEW_ROUND" -ge "$MAX_REVIEW_ROUNDS" ]; then
+    log "Ревью не пройдено за $MAX_REVIEW_ROUNDS круга — передаю человеку."
+    break
+  fi
+
+  log "Ревью вернуло REQUEST_CHANGES (круг $REVIEW_ROUND) — отдаю замечания агенту."
+  if ! agent_rework "$PR_URL" "$NUM" "Авто-ревью вернуло \`REQUEST_CHANGES\` по этому PR (круг $REVIEW_ROUND из $MAX_REVIEW_ROUNDS). Сами замечания — в комментарии выше.
+
+Не бросайся исправлять всё подряд: этот ревьюер ошибается примерно в трети
+блокеров, и всегда одинаково — судит по диффу относительно базы ветки,
+игнорируя зелёный CI и результат мержа.
+По каждому замечанию сначала установи факт: по коду, по статусу CI и по
+\`git merge-tree --write-tree origin/$BASE_BRANCH HEAD\`. Затем:
+- подтверждённое — исправь и запушь коммит в эту же ветку;
+- ошибочное — код НЕ трогай, ответь отдельным комментарием в PR, что именно
+  неверно и чем это опровергается.
+Если подтверждённых замечаний не нашлось вовсе — не коммить ничего, только ответь."; then
+    REWORK_WHY="агент не доработал PR по замечаниям ревью"
+    log "Доработки по ревью не случилось — передаю человеку."
+    break
+  fi
+
+  # Доработка могла сломать сборку — до следующего круга ревью перепроверяем.
+  sleep "$CI_START_WAIT"
+  if ! gh pr checks "$PR_URL" --watch; then
+    REWORK_WHY="после доработки по замечаниям ревью CI стал красным"
+    log "После доработки CI покраснел — передаю человеку."
+    break
+  fi
+  REVIEW_ROUND=$(( REVIEW_ROUND + 1 ))
+done
+
 # ═══ 5. Merge ═══════════════════════════════════════════════════════
-if [ "$AUTO_MERGE" = "true" ] && echo "$REVIEW" | grep -q "VERDICT: APPROVE"; then
+if [ "$REVIEW_OK" != true ]; then
+  gh issue edit "$NUM" --add-label "$HUMAN_LABEL"
+  gh issue comment "$NUM" --body "🛑 Нужен человек: $REWORK_WHY. PR: $PR_URL"
+  tg "🛑 AI dev loop: #$NUM «$TITLE» — $REWORK_WHY. Нужен ты: $PR_URL"
+  log "Стоп: $REWORK_WHY."
+  exit 0
+fi
+
+if [ "$AUTO_MERGE" = "true" ]; then
   gh pr merge "$PR_URL" --squash --auto
   gh issue comment "$NUM" --body "✅ Ревью пройдено, PR поставлен на авто-merge: $PR_URL"
   tg "✅ AI dev loop: #$NUM «$TITLE» готово и уходит в авто-merge: $PR_URL"

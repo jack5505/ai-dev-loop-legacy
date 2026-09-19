@@ -1,0 +1,16 @@
+[Unit]
+Description=Тик смотрителя бэклога (%i) — работает раз в неделю
+
+[Timer]
+# Тикаем ежечасно, а работаем раз в KEEPER_INTERVAL_DAYS (по умолчанию 7):
+# частоту держит сам скрипт по отметке .ai-logs/.backlog-keeper-last.
+# Недельный таймер тут не годится — смотритель берёт общий с оркестратором
+# замок, и попадание тика на многочасовую итерацию стоило бы целой недели.
+OnBootSec=10min
+OnUnitInactiveSec=1h
+# Разводим инстансы и не бьёмся в API в одну и ту же секунду.
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
