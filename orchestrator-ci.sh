@@ -218,12 +218,19 @@ SELF_LOGIN=$(gh api user --jq .login)
 if [ -z "$ALLOWED_AUTHORS" ]; then
   ALLOWED_AUTHORS="$SELF_LOGIN"
 fi
-AUTHOR_FILTER=""
-for a in $ALLOWED_AUTHORS; do AUTHOR_FILTER+=" author:$a"; done
-
-ISSUE_JSON=$(gh issue list --state open \
-  --search "label:$TASK_LABEL -label:$HUMAN_LABEL -label:blocked$AUTHOR_FILTER sort:created-asc" \
-  --json number,title,body --limit 1)
+# Несколько author: в ОДНОМ поисковом запросе GitHub складывает по И, а не
+# по ИЛИ: у issue автор ровно один, поэтому «author:a author:b» не находит
+# ничего и очередь выглядит вечно пустой. Спрашиваем по автору отдельно и
+# берём самую старую задачу из объединения — порядок тот же, что раньше.
+QUEUE_FILTER="label:$TASK_LABEL -label:$HUMAN_LABEL -label:blocked"
+ISSUE_JSON="[]"
+for a in $ALLOWED_AUTHORS; do
+  part=$(gh issue list --state open \
+    --search "$QUEUE_FILTER author:$a sort:created-asc" \
+    --json number,title,body,createdAt --limit 1)
+  ISSUE_JSON=$(jq -s 'add | sort_by(.createdAt) | .[0:1]' \
+    <(echo "$ISSUE_JSON") <(echo "$part"))
+done
 
 if [ "$(echo "$ISSUE_JSON" | jq 'length')" -eq 0 ]; then
   log "Очередь пуста — нечего делать. ✅"
